@@ -1,95 +1,125 @@
 # Money rules agent (simulation prototype)
 
-Plain-English money-routing rules are turned into strictly typed rule specs, validated against a JSON Schema, simulated over a synthetic ledger, held for human approval where required, and recorded in an append-only audit log that can explain why any transfer happened.
+![Demo: type a plain-English rule, see the parsed spec, a second person approves, the month is processed, one transfer is approved and traced back to the rule text](docs/demo.gif)
 
-> **Simulation only.** All accounts, transactions and transfers are fictional. Nothing connects to a bank or payment provider, and no money moves. "Executed" means a simulated state change in a local file.
+*About 24 seconds in the real web UI: type a rule, see how the agent read it, approve it as a second person, process the ledger month, approve one transfer, then open its "why did this happen" trace. ([MP4 version](docs/demo.mp4))*
+
+Plain-English money-routing rules are turned into strictly typed rule specs by a small agent (guard, strict grammar, model step, validation), simulated over a synthetic ledger, held for a human decision where policy requires it, and recorded in a hash-chained event log. The log is the system of record: application state is a fold over it, every decision is applied exactly once, and any transfer can be traced back to the sentence that caused it.
+
+> **Simulation only.** All accounts, transactions and transfers are fictional. Nothing connects to a bank or payment provider, and no money moves. "Executed" means a simulated state change in a local event log.
 
 ## Problem
 
-Users want rules such as "when my salary arrives, move 20% to savings" or "if checking drops below £200, top it up from savings". Those rules touch real money, so the system must:
+Users want rules such as "when my salary arrives, move 20% to savings" or "if checking drops below £200, top it up from savings". Those rules touch money, so the system must:
 
-- never guess an amount, account or schedule (it asks instead),
-- reject rules that cannot be made precise,
+- never guess an amount, account or schedule (it asks instead) and never accept "move everything",
+- treat model output as untrusted: schema, semantic and grounding checks before anything is stored,
 - stop transfers that would overdraw an account, exceed a limit, or loop money between accounts,
-- require a human decision for large amounts and for rules nobody has approved yet,
-- keep a record that ties every transfer back to the exact rule text that caused it.
+- require a human decision for large amounts and for rules nobody has approved, with separation of duties,
+- keep a record that ties every transfer back to the exact rule text and the people who approved it.
+
+## Screenshots
+
+| | |
+| --- | --- |
+| ![Rule entry](docs/screenshots/01-rule-parsed.png) | ![Clarifying question](docs/screenshots/02-rule-clarify.png) |
+| 1. A paraphrase is parsed into a typed spec; the chips show which stage produced it, plus a no-side-effect preview. | 2. A vague rule gets a question instead of a guess. |
+| ![Pending approvals](docs/screenshots/03-pending-approvals.png) | ![Trace](docs/screenshots/04-trace.png) |
+| 3. Pending approvals, each linked to its trace. | 4. "Why did this happen": from the executed transfer back to the typed rule text. |
+| ![Audit chain](docs/screenshots/05-audit-chain.png) | ![Evals](docs/screenshots/06-eval-results.png) |
+| 5. Hash chain verified, with event counts. | 6. Eval results rendered from the real run. |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  User["Plain-English rule"] --> Det["Deterministic parser (documented subset)"]
-  Det -- "ok, clarify or reject" --> Val["JSON Schema + semantic validation"]
-  Det -. "reject only" .-> LLM["Optional LLM backend (env var, same validation)"]
-  LLM --> Val
-  Val --> Rules[("state.json: rules")]
-  Rules --> Sim["Simulation over synthetic ledger"]
-  Sim --> Safety["Safety: loop and over-allocation checks, overdraft, per-transfer limit"]
-  Safety --> Policy{"Approval policy: unapproved rule or amount above threshold?"}
-  Policy -- "no" --> Auto["Auto-executed (simulated)"]
-  Policy -- "yes" --> Human["Human approve or reject"]
-  Human --> Sim
-  Auto --> Audit[("audit.jsonl: hash-chained")]
-  Human --> Audit
-  Rules --> Audit
-  Audit --> Explain["explain: transfer back to rule text"]
-  CLI["CLI"] --> Rules
-  Web["Local web page"] --> Rules
+  Text["Rule text"] --> Guard["Guard: length, links, injection phrases, long numbers"]
+  Guard --> Grammar["Strict grammar"]
+  Grammar -- "phrasing not covered" --> Model["Model step: offline slot extractor, or LLM provider"]
+  Grammar -- "ok, clarify, invalid" --> Val
+  Model -- "untrusted proposal" --> Val["JSON Schema + semantic + grounding checks"]
+  Val --> Log[("events.jsonl: hash-chained")]
+  Log --> State["State = fold over events"]
+  State --> Proc["Process ledger month once: proposals with stable ids"]
+  Proc --> Policy{"Auto or human?"}
+  Policy -- "small, rule approved" --> Exec["transfer.executed"]
+  Policy -- "large or unapproved rule" --> Pending["pending approval"]
+  Pending -- "decision, once" --> Exec
+  Exec --> Log
+  Log --> Trace["Trace: transfer back to rule text"]
 ```
-
-### Components
 
 | Module | Role |
 | --- | --- |
-| `rules_agent/parser.py` | Deterministic parser for the documented phrasing subset. Returns `ok`, `clarify` (with a question) or `reject` (with reasons). |
-| `rules_agent/schema.py` | `RULE_SPEC_SCHEMA` (JSON Schema 2020-12) plus semantic checks such as percentages summing to at most 100 and top-ups targeting their trigger account. |
-| `rules_agent/llm.py` | Optional OpenAI-compatible provider behind a small interface. Used only when the deterministic parser rejects a rule, and its output must pass the same validation. |
-| `rules_agent/ledger.py` | Seeded synthetic ledger: three fictional accounts and one month of fake transactions. |
-| `rules_agent/engine.py` | Simulation: fires triggers (deposit, balance below, monthly), computes amounts, applies safety checks, and sorts proposals into auto, pending or blocked. |
-| `rules_agent/safety.py` | Static conflict detection (over-allocation, account loops) and runtime checks (overdraft, per-transfer limit, approval policy). |
-| `rules_agent/audit.py` | Append-only JSON Lines log. Each entry stores the hash of the previous entry, so edits are detectable with `verify`. |
-| `rules_agent/service.py` | Workflow layer used by the CLI and the web page. Every state change is audited; `explain` builds the trace. |
-| `rules_agent/cli.py`, `rules_agent/web.py` | Command line and a stdlib-only local web page (rules, proposals awaiting approval, conflicts, audit trail). |
+| `agent.py` | Pipeline and trace: guard, grammar, model proposal, validation, grounding, optional LLM/offline agreement check. |
+| `parser.py` | Strict grammar for the documented phrasings. |
+| `offline_model.py` | Deterministic intent/slot extractor behind the provider interface: normalises amounts, fractions, ordinals and account synonyms, locates one trigger, fills slots per clause, fails closed on leftover words. No API key needed. |
+| `llm.py` | Provider interface (`propose(text) -> spec \| clarify \| reject`) and an OpenAI-compatible provider configured from environment variables. |
+| `schema.py` | JSON Schema 2020-12 for rule specs plus semantic checks. |
+| `engine.py` | Walks a ledger month once and returns events; proposal ids are `<rule>-<ledger event>-a<n>`. |
+| `projection.py` | Pure, idempotent fold from events to state. |
+| `service.py` | Commands (submit, approve rule, process, decide) and the trace. Idempotent; four-eyes on rule approval. |
+| `safety.py` | Over-allocation and loop detection, overdraft, per-transfer limit, approval policy. |
+| `audit.py` | Append-only hash-chained JSON Lines with a file lock. |
+| `evals.py`, `evals/rule_cases.json` | Labelled sentences and metrics. |
+| `auth.py`, `web.py` | Local demo users, sessions, CSRF, and the web UI (stdlib only). |
 
-## Supported rule phrasing
+### Agent design
+
+1. **Guard.** Rejects empty or over-long text, control characters, links, credential-like words, instructions aimed at the assistant, and long digit strings (account or card numbers).
+2. **Strict grammar.** The original deterministic parser handles canonical phrasings and returns a spec, a question, or a final rejection (for example percentages above 100%).
+3. **Model step.** Only for phrasing the grammar does not cover. The default is the offline extractor; set the `RULES_LLM_*` variables to use a real provider instead. The model returns `{"spec"}`, `{"clarify"}` or `{"reject"}`.
+4. **Validation.** Whatever the model proposes must pass JSON Schema, semantic checks, and a grounding check (every number in the spec must appear in the rule text, so an invented amount is rejected).
+5. **Agreement check (LLM path).** If an LLM and the offline extractor both return specs and they differ, the user is asked to rephrase rather than one being picked.
+
+Every stage is recorded in a trace stored with the rule, so reviewers see which stage produced the spec.
+
+### Event-sourced execution
+
+- All state changes are events in the hash-chained log; state is rebuilt by folding it. A new process sees exactly the same state.
+- Processing a ledger month once emits `proposal.created` events with stable ids; processing it again creates nothing.
+- A human decision is one `proposal.decision` event. Repeating the same decision is a no-op, the opposite decision is refused (decisions are final), and approval executes only that proposal, once, after re-checking balances (it is blocked if the account no longer has the money). Nothing else is recomputed, withdrawn or re-proposed.
+- Rules are approved by a different person from the submitter. Conflicting rules cannot be approved.
+
+## Supported phrasing
+
+The strict grammar accepts, for example:
 
 ```
-When my <tag> arrives, <actions>            e.g. "When my salary arrives, ..."
-If [my] <account> drops below £<amount>, <actions>
-On the <day>st, <actions>                   or: <actions> on the 1st
+When my salary arrives, move 20% to savings and £300 to the holiday pot
+If checking drops below £200, top it up from savings
+Pay £850 to landlord from checking on the 1st
 ```
 
-Actions, joined with `and` or `;`:
+The offline extractor additionally handles paraphrases such as:
 
-- `move <n>% [from <account>] to <account>`
-- `move £<amount> [from <account>] to <account>`
-- `top it up from <account>` (only after an "drops below" trigger)
-- `pay £<amount> [to] <payee> from <account>`
+```
+Whenever I get paid, stash a fifth in my rainy day fund
+if my current account falls under 150 quid then top it up from savings
+every month on the fifteenth send £850 to landlord from checking
+when salary lands, put 10% into savings and £50 towards holiday
+```
 
-Accounts: `checking`, `savings`, `holiday pot`. A deposit lands in `checking`, which is the default source for `move` actions. Days must be 1 to 28.
-
-Outcomes:
-
-- **ok**: a typed spec is stored as `pending_review`.
-- **clarify**: a question is returned, for example `Pay rent on the 1st` asks for the amount and source account.
-- **reject**: reasons are returned, for example an unknown account, percentages above 100%, or no trigger.
+Accounts are `checking`, `savings` and `holiday pot` (with synonyms). Anything else becomes a payee only for `pay`/`send`, never for moves. Days are 1 to 28.
 
 ## How to run
 
 Requirements: Python 3.10 or newer. Nothing else is needed for the default offline mode.
 
 ```sh
-scripts/test.sh                                  # creates .venv on first run, runs pytest
-
-.venv/bin/python -m rules_agent demo             # load examples/rules.txt, approve, simulate
+scripts/test.sh                                   # creates .venv on first run, runs pytest
+.venv/bin/python -m rules_agent demo              # load examples, approve, process the month
+.venv/bin/python -m rules_agent parse "Whenever I get paid, stash a fifth in my rainy day fund"
 .venv/bin/python -m rules_agent proposals
-.venv/bin/python -m rules_agent approve <id>     # or: reject <id> --note "..."
-.venv/bin/python -m rules_agent run              # re-simulate after decisions
-.venv/bin/python -m rules_agent explain <id>     # trace a transfer back to the rule text
-.venv/bin/python -m rules_agent verify           # check the audit hash chain
-.venv/bin/python -m rules_agent web --port 8765  # http://localhost:8765/
-.venv/bin/python -m rules_agent reset            # clear local state (data/ is gitignored)
+.venv/bin/python -m rules_agent approve <id> --note "..."    # applied once
+.venv/bin/python -m rules_agent explain <id>      # trace a transfer back to the rule text
+.venv/bin/python -m rules_agent verify            # check the audit hash chain
+.venv/bin/python -m rules_agent eval --html evals.html
+.venv/bin/python -m rules_agent web --port 8765   # log in at http://localhost:8765/
+.venv/bin/python -m rules_agent reset
 ```
+
+The web server generates two demo users (`operator`, who submits rules and processes the ledger, and `approver`, who approves rules and transfers) on first start. Their generated passphrases are written to `data/demo_logins.txt`, which is git-ignored; nothing is committed. Sessions use an HttpOnly, SameSite=Strict cookie that is rotated on login. Every POST needs a per-session CSRF token and a same-origin `Origin`; the `Host` header must be `localhost`; failed logins are throttled.
 
 Optional LLM backend (no key is stored in the repository):
 
@@ -100,121 +130,45 @@ export RULES_LLM_KEY=<from your credential manager>
 export RULES_LLM_MODEL=<model-id>
 ```
 
-## Example session
+To regenerate the images: `.venv/bin/pip install -r requirements-dev.txt`, then `scripts/screenshots.py` and `scripts/record_demo.py` (headless Chrome, driving the real UI; ffmpeg comes from `imageio-ffmpeg`).
 
-Output below was produced by running the commands in this repository (trimmed).
+## Evals
 
-```text
-$ python -m rules_agent demo
-R1 [pending_review] When my salary arrives, move 20% to savings and £300 to the holiday pot
-R2 [pending_review] If checking drops below £200, top it up from savings
-R3 [pending_review] Pay £850 to landlord from checking on the 1st
-Proposals by status: {'pending_approval': 4}
-R3-sched-2026-11-01-a1  pending_approval    £850.00  checking -> landlord  2026-11-01
-      amount is above the £250 approval threshold
-R2-TX-1114-15-a1  pending_approval    £484.56  savings -> checking  2026-11-14
-      amount is above the £250 approval threshold
-R1-TX-1125-21-a1  pending_approval    £480.00  checking -> savings  2026-11-25
-      amount is above the £250 approval threshold
-R1-TX-1125-21-a2  pending_approval    £300.00  checking -> holiday pot  2026-11-25
-      amount is above the £250 approval threshold
+`python -m rules_agent eval` runs 134 labelled sentences (61 should parse to an exact spec, 28 need a clarifying question, 45 must be rejected: unsafe, adversarial or invalid) plus 6 two-rule conflict scenarios. Real numbers from the run in this repository:
 
-$ python -m rules_agent approve R3-sched-2026-11-01-a1 --note "rent confirmed"
-R3-sched-2026-11-01-a1 approved; simulation re-run.
-$ python -m rules_agent approve R1-TX-1125-21-a1 --note "matches budget"
-$ python -m rules_agent approve R1-TX-1125-21-a2 --note "matches budget"
-$ python -m rules_agent run
-Proposals by status: {'approved': 3, 'auto_executed': 1}
-[warning] Money can loop checking -> savings -> checking via rules R1, R2.
-R2-TX-1103-04-a1  auto_executed        £56.39  savings -> checking  2026-11-03
-      within approval threshold and rule already approved
-Projected end-of-month balances: checking £473.35, savings £3,423.61, holiday pot £700.00
-
-$ python -m rules_agent explain R1-TX-1125-21-a1
-Transfer R1-TX-1125-21-a1: £480.00 from checking to savings on 2026-11-25
-Status: approved (simulated, no real money moves)
-Caused by rule R1: "When my salary arrives, move 20% to savings and £300 to the holiday pot"
-  Parsed as: when a 'salary' deposit arrives: 20% of the trigger amount from checking to savings; £300.00 from checking to holiday pot
-  Rule source: deterministic; status: active (approved by demo-operator)
-Trigger event: TX-1125-21 (Example Payroll Ltd salary, 2026-11-25): deposit of £2,400.00 tagged 'salary'
-Reasons: approved by cli
-Safety checks: passed
-Human decision: approved by cli at 2026-11-24T06:13:06+00:00 (matches budget)
-Audit trail:
-  #1   rule.submitted     hash 1ed695a3aa02
-  #2   rule.parsed        hash 5a993356d7b0
-  #7   rule.approved      hash c11defa86e80
-  #11  proposal.created   hash ffff4d4f9dfb
-  #25  proposal.decision  hash e45255cd7367
-  #27  proposal.status    hash 7ccc0553a30d
-  #28  transfer.executed  hash 136c3789a903
-
-$ python -m rules_agent verify
-33 entries verified; chain intact
-```
-
-Rejections and clarifications, from the same CLI (rule IDs continue from the existing data directory):
-
-```text
-$ python -m rules_agent add "Pay rent on the 1st"
-R6 [invalid] Pay rent on the 1st
-    clarify: Pay how much, and from which account? For example 'pay £850 to landlord from checking'.
-$ python -m rules_agent add "When my salary arrives, move 70% to savings and 40% to holiday pot"
-    rejected: percentages in this rule add up to 110% (maximum is 100%)
-$ python -m rules_agent add "If checking drops below £200, top it up from current"
-    rejected: Unknown account 'current'. Known accounts: checking, savings, holiday pot.
-$ python -m rules_agent add "Move some money to savings when I get paid"
-    rejected: No trigger found. Start the rule with 'When my <tag> arrives,' or ...
-```
-
-Note that approving the rent changed the balance path, so the top-up that was first proposed for 14 November was withdrawn and replaced by a 3 November top-up of £56.39. The audit log records this as a `proposal.withdrawn` event. Decisions are per proposal ID, and every run recomputes the month from the rules and the decisions so far.
-
-## Safety checks
-
-| Check | Where | Effect |
+| Metric | Full agent | Strict grammar only |
 | --- | --- | --- |
-| Schema and semantic validation | `schema.py` | Invalid specs are rejected with paths and messages. |
-| Percentages in one rule above 100% | `schema.py` | Rejected. |
-| Percentages on the same deposit source above 100% across rules | `safety.py` | Error: all involved rules are blocked. |
-| Money loops between internal accounts | `safety.py` | Error if the cycle is made only of balance top-ups (unbounded ping-pong). Warning otherwise. |
-| Overdraft (projected balance below minimum) | `safety.py` | Proposal blocked. |
-| Amount above per-transfer limit (£1,000) | `safety.py` | Proposal blocked. |
-| Amount above approval threshold (£250) or rule not yet approved | `safety.py` | Proposal waits for a human decision. |
-| Balance triggers fire once per crossing | `engine.py` | Edge-triggered, so a balance that stays low does not re-fire. |
+| Exact-spec accuracy (61 valid rules) | 98.4% (60/61) | 22.9% |
+| Status accuracy (all 134) | 98.5% | 44.8% |
+| Clarify recall (28) / precision | 96.4% / 100% | 17.9% / 50.0% |
+| Reject recall (45) | 100% | 91.1% |
+| False-reject rate (valid rules refused) | 1.6% | 75.4% |
+| **Unsafe-accept rate (73 must-not-accept cases)** | **0%** | 0% |
+| Conflict detection (6 scenarios) | 6/6 | n/a |
 
-## Test results
+Honest reading of these numbers:
 
-Command: `scripts/test.sh` (runs `pytest -q`).
+- The set was written alongside the extractor and tuned to 103/103 on the 103 development sentences. The 31 sentences in the `holdout` split were written afterwards and measured once before any change: **exact-spec 90.9% (10/11), status 93.5% (29/31), clarify recall 87.5% (7/8), 0 unsafe accepts**. That is the better estimate of how it generalises, from a small sample.
+- The two held-out misses are safe: a valid rule refused ("..., split: 10% to savings and 10% to the holiday fund", because "split" is not understood) and a vague payee rule that was rejected instead of clarified.
+- The unsafe-accept test is enforced by the test suite, so a change that lets any unsafe or adversarial sentence through fails CI.
+- The LLM path is covered by fake-transport tests only; there is no measured accuracy for a real model.
 
-```text
-......................................                                   [100%]
-38 passed in 0.24s
-```
+## Tests
 
-Coverage by file:
+`scripts/test.sh` runs `pytest -q`: 74 tests, all passing.
 
-- `tests/test_parser.py` (11 tests): valid phrasings produce exact specs, ambiguous rules get a question, unknown accounts, percentages above 100%, day range, top-up without a balance trigger, and empty input are rejected.
-- `tests/test_schema.py` (14 tests): schema bounds and unknown keys, semantic rules, LLM output that passes or fails validation, clarify pass-through, non-JSON output, provider configuration from the environment. The LLM tests use a fake transport, not a live provider.
-- `tests/test_safety.py` (7 tests): over-allocation, ping-pong loops as errors, loops through deposit rules as warnings, overdraft, per-transfer limit, approval policy.
-- `tests/test_audit.py` (6 tests): hash chain verification and tamper detection, logging of rule text and parsed spec, pending approval for unapproved rules, `explain` tracing, approve and reject flows, determinism of the simulation.
-
-The web page was smoke-tested on localhost: the page returns 200, rule submission redirects, and invalid decisions return 400.
+- `test_parser.py`, `test_schema.py`, `test_safety.py`: grammar, schema and semantic checks, conflicts, limits.
+- `test_agent.py`: guard, paraphrases, fail-closed behaviour, trace, LLM path (grounding, validation, fallback, disagreement) with a fake transport.
+- `test_evals.py`: set size and shape, zero unsafe accepts, quality floors, held-out floor.
+- `test_audit.py`: hash chain, idempotent processing, stable ids, approvals applied once without re-running the month, final decisions, replay equals live state, four-eyes, execution-time balance check, preview stores nothing, trace.
+- `test_web.py`: a real server on localhost: login and lockout, role separation, CSRF and origin checks, host check, escaping, double-submit approval, trace and audit pages.
 
 ## Limitations
 
-- **Simulation only.** No bank, payment or open-banking integration. The ledger is synthetic and covers one month of one currency (GBP).
-- **Narrow grammar.** The deterministic parser handles the documented phrasings only. Anything else is rejected or answered with a question. It does not understand relative dates, fees, time zones or settlement delays.
-- **LLM backend is not evaluated.** It is implemented behind an interface and its output is validated, but it has only been tested with a fake transport. No accuracy measurement exists.
-- **Approvals are a re-simulation.** A decision re-runs the whole month, so downstream proposals can change or disappear. Withdrawn proposals are logged, but the operator may need to review them again.
-- **Balance triggers are evaluated once per ledger event.** Cascades from transfers that a balance rule itself applies are not re-evaluated within the same event.
-- **Loop detection is account-level.** It finds cycles among the three internal accounts, not every possible interaction.
-- **Local, single-user storage.** State is a JSON file and the web page has no authentication or CSRF protection. It binds to localhost only. Approver names are free text, not verified identities.
-- **Tamper evidence, not tamper proofing.** The hash chain shows edits made to the file, but whoever controls the file can rewrite the whole chain. Anchoring the head hash elsewhere would be needed for a stronger guarantee.
-
-## Next steps
-
-- Build a labelled set of rule phrasings (accepted, clarified, rejected) and measure the deterministic parser and any LLM provider against it.
-- Replace the whole-month re-run with per-proposal recomputation, or freeze approved proposals and show their downstream impact before approval.
-- Add a time model (pay dates, settlement lag) and a longer simulation window.
-- Move storage to SQLite with proper locking, and add authentication for the web page.
-- Sign audit entries or anchor the chain head outside the file.
+- **Simulation only.** No bank, payment or open-banking integration. The ledger is synthetic and generated month by month in one currency (GBP).
+- **The model step is still a rule-based stand-in.** The offline extractor covers many paraphrases but not free-form language; unfamiliar phrasing is refused or questioned, not understood. A real LLM provider is implemented and validated, but only tested with a fake transport.
+- **Small eval set.** 134 sentences written by one author; the held-out split has 31.
+- **Pending proposals do not move projected balances.** Each proposal is checked against balances when it is created and again when it is approved; a month with many pending items can look different once they are all approved.
+- **Rules apply from the moment a ledger month is processed.** A rule added after a month was processed does not backfill it (the preview shows what it would have done); it applies to the next month.
+- **Demo-grade web security.** Local users and in-memory sessions, localhost only; not a production auth system.
+- **Tamper evidence, not tamper proofing.** The hash chain shows edits, but whoever controls the file can rewrite the whole chain; anchoring the head hash elsewhere would be needed.

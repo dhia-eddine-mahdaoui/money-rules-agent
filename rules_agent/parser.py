@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 
+from .offline_model import SALARY_WORDS, TAG_ADJECTIVES
 from .schema import INTERNAL_ACCOUNTS, MAX_ACTIONS, validate_spec
 
 ACCOUNT_ALIASES = {"checking": "checking", "savings": "savings", "holiday pot": "holiday_pot"}
@@ -50,18 +51,32 @@ class ParseResult:
     spec: dict | None = None
     messages: list = field(default_factory=list)
     question: str | None = None
-    source: str = "deterministic"
+    source: str = "grammar"
+    code: str = ""  # reject only: "unsupported" (phrasing not understood, a model may try) or "invalid" (final)
+    trace: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def _reject(messages: list[str]) -> ParseResult:
-    return ParseResult("reject", messages=messages)
+def _reject(messages: list[str], code: str | None = None) -> ParseResult:
+    if code is None:
+        unsupported = ("Unknown account", "Could not understand", "No trigger found")
+        code = "unsupported" if any(m.startswith(unsupported) for m in messages) else "invalid"
+    return ParseResult("reject", messages=messages, code=code)
+
+
+# Questions asked when a clause starts like an action but does not match any pattern. The grammar
+# cannot tell what is missing, so the model stage gets a chance to read the sentence.
+FALLTHROUGH_QUESTIONS = (
+    "How much should move, and to which account? For example 'move 10% to savings' or 'move £100 to savings'.",
+    "Pay how much, and from which account? For example 'pay £850 to landlord from checking'.",
+    "Top up from which account? For example 'top it up from savings'.",
+)
 
 
 def _clarify(question: str) -> ParseResult:
-    return ParseResult("clarify", question=question)
+    return ParseResult("clarify", question=question, code="unsupported" if question in FALLTHROUGH_QUESTIONS else "")
 
 
 def normalize(text: str) -> str:
@@ -113,7 +128,8 @@ def _parse_trigger(text: str) -> tuple[dict | None, str | None]:
     """Returns (trigger, None) on success, (None, error) when matched but invalid, (None, None) when not matched."""
     match = RE_DEPOSIT.match(text)
     if match:
-        tag = match.group("tag").strip().replace(" ", "_")
+        words = [w for w in match.group("tag").split() if w not in TAG_ADJECTIVES]
+        tag = "salary" if words and all(w in SALARY_WORDS for w in words) else "_".join(words)
         if not re.fullmatch(r"[a-z_]{3,20}", tag):
             return None, f"Deposit tag '{tag}' must be 3-20 letters, for example 'salary'."
         return {"type": "deposit", "tag": tag}, None
@@ -174,6 +190,8 @@ def _parse_action(part: str, trigger: dict):
     """Returns (action, error, question). Exactly one of them is normally set."""
     match = RE_PCT_MOVE.match(part)
     if match:
+        if trigger["type"] != "deposit":
+            return None, "Percentage amounts need a deposit trigger (a percentage of what arrived); use a fixed £ amount instead.", None
         dst = _account(match.group("dst"))
         if dst is None:
             return None, _unknown_account(match.group("dst")), None

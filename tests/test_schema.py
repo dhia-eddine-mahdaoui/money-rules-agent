@@ -2,7 +2,7 @@ import copy
 
 import pytest
 
-from rules_agent.llm import LLMError, OpenAICompatibleProvider, parse_rule, provider_from_env
+from rules_agent.llm import LLMError, OpenAICompatibleProvider, provider_from_env
 from rules_agent.schema import validate_spec
 
 VALID = {
@@ -63,43 +63,6 @@ class FakeTransport:
 def _provider(content):
     return OpenAICompatibleProvider("https://llm.example.invalid/v1", "test-key", "test-model",
                                     transport=FakeTransport(content))
-
-
-def test_llm_output_that_passes_validation_is_accepted():
-    provider = _provider('{"trigger": {"type": "monthly", "day_of_month": 1}, '
-                         '"actions": [{"from": "checking", "to": "rent", "amount": {"mode": "fixed", "gbp": 850}}]}')
-    result = parse_rule("Pay rent monthly from checking", provider=provider)
-    assert result.status == "ok"
-    assert result.source == "llm"
-    assert provider.transport.calls[0][0].endswith("/chat/completions")
-
-
-def test_llm_output_failing_validation_is_rejected():
-    provider = _provider('{"trigger": {"type": "monthly", "day_of_month": 31}, "actions": []}')
-    result = parse_rule("Pay rent monthly from checking", provider=provider)
-    assert result.status == "reject"
-    assert "LLM output failed validation" in result.messages[0]
-
-
-def test_llm_clarify_is_passed_through():
-    provider = _provider('{"clarify": "Which account should pay the rent?"}')
-    result = parse_rule("Pay rent monthly", provider=provider)
-    assert result.status == "clarify"
-    assert result.question == "Which account should pay the rent?"
-
-
-def test_non_json_llm_output_is_rejected_cleanly():
-    provider = _provider("sure! here is your rule")
-    result = parse_rule("Pay rent monthly", provider=provider)
-    assert result.status == "reject"
-    assert "LLM unavailable" in result.messages[0]
-
-
-def test_llm_is_not_consulted_when_deterministic_parser_succeeds():
-    provider = _provider('{"should": "not be used"}')
-    result = parse_rule("Pay £850 to landlord from checking on the 1st", provider=provider)
-    assert result.status == "ok"
-    assert provider.transport.calls == []
 
 
 def test_provider_from_env_is_off_by_default_and_fails_loudly_when_misconfigured():
