@@ -1,0 +1,4 @@
+# Example rules for `python -m rules_agent demo`. Lines starting with # are ignored.
+When my salary arrives, move 20% to savings and £300 to the holiday pot
+If checking drops below £200, top it up from savings
+Pay £850 to landlord from checking on the 1st
